@@ -12,10 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from data import data_loaders
 from model import RandLANet
-from utils.tools import Config as cfg
-from utils.metrics import accuracy, intersection_over_union
+from util.tools import Config as cfg
+from util.metrics import accuracy, intersection_over_union
+
+import os
+import sys
+
+sys.path.insert(1, os.path.join(sys.path[0], ".."))
+
+from frenet import get_dataloader
 
 def evaluate(model, loader, criterion, device):
     model.eval()
@@ -23,9 +29,10 @@ def evaluate(model, loader, criterion, device):
     accuracies = []
     ious = []
     with torch.no_grad():
-        for points, labels in tqdm(loader, desc='Validation', leave=False):
-            points = points.to(device)
+        for trunk_id, points, labels in tqdm(loader, desc='Validation', leave=False):
+            points = points.to(device).float()
             labels = labels.to(device)
+            labels = (labels > 0).type(labels.dtype)
             scores = model(points)
             loss = criterion(scores, labels)
             losses.append(loss.cpu().item())
@@ -35,28 +42,34 @@ def evaluate(model, loader, criterion, device):
 
 
 def train(args):
-    train_path = args.dataset / args.train_dir
-    val_path = args.dataset / args.val_dir
     logs_dir = args.logs_dir / args.name
     logs_dir.mkdir(exist_ok=True, parents=True)
 
     # determine number of classes
-    try:
-        with open(args.dataset / 'classes.json') as f:
-            labels = json.load(f)
-            num_classes = len(labels.keys())
-    except FileNotFoundError:
-        num_classes = int(input("Number of distinct classes in the dataset: "))
+    num_classes = 2
 
-    train_loader, val_loader = data_loaders(
-        args.dataset,
-        args.dataset_sampling,
+    train_loader, _ = get_dataloader(
+        species="seg_den",
+        path_length=args.path_length,
+        num_points=args.npoint,
+        fold=args.fold,
+        is_train=True,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=True
+        frenet=args.frenet,
+    )
+    val_loader, _ = get_dataloader(
+        species="seg_den",
+        path_length=args.path_length,
+        num_points=args.npoint,
+        fold=args.fold,
+        is_train=False,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        frenet=args.frenet,
     )
 
-    d_in = next(iter(train_loader))[0].size(-1)
+    d_in = next(iter(train_loader))[1].size(-1)
 
     model = RandLANet(
         d_in,
@@ -66,16 +79,7 @@ def train(args):
         device=args.gpu
     )
 
-    print('Computing weights...', end='\t')
-    samples_per_class = np.array(cfg.class_weights)
-
-    n_samples = torch.tensor(cfg.class_weights, dtype=torch.float, device=args.gpu)
-    ratio_samples = n_samples / n_samples.sum()
-    weights = 1 / (ratio_samples + 0.02)
-
-    print('Done.')
-    print('Weights:', weights)
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    criterion = nn.CrossEntropyLoss()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.adam_lr)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, args.scheduler_gamma)
@@ -103,9 +107,10 @@ def train(args):
             ious = []
 
             # iterate over dataset
-            for points, labels in tqdm(train_loader, desc='Training', leave=False):
-                points = points.to(args.gpu)
+            for trunk_id, points, labels in tqdm(train_loader, desc='Training', leave=False):
+                points = points.to(args.gpu).float()
                 labels = labels.to(args.gpu)
+                labels = (labels > 0).type(labels.dtype)
                 optimizer.zero_grad()
 
                 scores = model(points)
@@ -203,33 +208,22 @@ if __name__ == '__main__':
     dirs = parser.add_argument_group('Storage directories')
     misc = parser.add_argument_group('Miscellaneous')
 
-    base.add_argument('--dataset', type=Path, help='location of the dataset',
-                        default='datasets/s3dis/subsampled')
-
     expr.add_argument('--epochs', type=int, help='number of epochs',
-                        default=50)
+                        default=100)
     expr.add_argument('--load', type=str, help='model to load',
                         default='')
 
     param.add_argument('--adam_lr', type=float, help='learning rate of the optimizer',
                         default=1e-2)
     param.add_argument('--batch_size', type=int, help='batch size',
-                        default=1)
+                        default=16)
     param.add_argument('--decimation', type=int, help='ratio the point cloud is divided by at each layer',
                         default=4)
-    param.add_argument('--dataset_sampling', type=str, help='how dataset is sampled',
-                        default='active_learning', choices=['active_learning', 'naive'])
     param.add_argument('--neighbors', type=int, help='number of neighbors considered by k-NN',
                         default=16)
     param.add_argument('--scheduler_gamma', type=float, help='gamma of the learning rate scheduler',
                         default=0.95)
 
-    dirs.add_argument('--test_dir', type=str, help='location of the test set in the dataset dir',
-                        default='test')
-    dirs.add_argument('--train_dir', type=str, help='location of the training set in the dataset dir',
-                        default='train')
-    dirs.add_argument('--val_dir', type=str, help='location of the validation set in the dataset dir',
-                        default='val')
     dirs.add_argument('--logs_dir', type=Path, help='path to tensorboard logs',
                         default='runs')
 
@@ -241,23 +235,26 @@ if __name__ == '__main__':
                         default=0)
     misc.add_argument('--save_freq', type=int, help='frequency of saving checkpoints',
                         default=10)
+    expr.add_argument("--npoint", type=int, default=2048, metavar="N")
+    expr.add_argument("--path_length", type=int, help="path length")
+    expr.add_argument("--fold", type=int, help="fold")
+    expr.add_argument(
+        "--frenet", action="store_true", help="whether to use Frenet transformation"
+    )
 
     args = parser.parse_args()
 
-    if args.gpu >= 0:
-        if torch.cuda.is_available():
-            args.gpu = torch.device(f'cuda:{args.gpu:d}')
-        else:
-            warnings.warn('CUDA is not available on your machine. Running the algorithm on CPU.')
-            args.gpu = torch.device('cpu')
-    else:
-        args.gpu = torch.device('cpu')
+    args.gpu = torch.device("cuda")
+    # if args.gpu >= 0:
+    #     if torch.cuda.is_available():
+    #         args.gpu = torch.device(f'cuda:{args.gpu:d}')
+    #     else:
+    #         warnings.warn('CUDA is not available on your machine. Running the algorithm on CPU.')
+    #         args.gpu = torch.device('cpu')
+    # else:
+    #     args.gpu = torch.device('cpu')
 
-    if args.name is None:
-        if args.load:
-            args.name = args.load
-        else:
-            args.name = datetime.now().strftime('%Y-%m-%d_%H:%M')
+    args.name = f"{args.fold}_{args.path_length}_{args.npoint}_{args.frenet}"
 
     t0 = time.time()
     train(args)
